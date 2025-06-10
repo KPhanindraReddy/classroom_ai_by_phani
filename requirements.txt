@@ -1,3 +1,8 @@
+--extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly
+--pre
+
+openvino
+openvino-tokenizers
 openvino-genai
 gradio>=4.0
 pandas
@@ -10,3 +15,4 @@ librosa
 transformers
 google-api-python-client
 huggingface_hub
+py-cpuinfo

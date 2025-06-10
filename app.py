@@ -1,7 +1,7 @@
 import time
 import gradio as gr
 import pandas as pd
-import openvino_genai as ov_genai
+import openvino_genai
 from huggingface_hub import snapshot_download
 from threading import Lock, Event
 import os
@@ -20,11 +20,6 @@ import textwrap
 from queue import Queue, Empty
 from concurrent.futures import ThreadPoolExecutor
 from typing import Generator
-import warnings
-from transformers import pipeline
-
-# Suppress specific OpenVINO deprecation warning
-warnings.filterwarnings("ignore", category=DeprecationWarning, module="openvino.runtime")
 
 # Google API configuration
 GOOGLE_API_KEY = "AIzaSyAo-1iW5MEZbc53DlEldtnUnDaYuTHUDH4"
@@ -48,30 +43,30 @@ class UnifiedAISystem:
     def initialize_models(self):
         """Initialize all required models"""
         # Download models if not exists
-        model_paths = {
-            "mistral-ov": "OpenVINO/mistral-7b-instruct-v0.1-int8-ov",
-            "internvl-ov": "OpenVINO/InternVL2-1B-int8-ov"
-        }
-
-        for local_dir, repo_id in model_paths.items():
-            if not os.path.exists(local_dir):
-                snapshot_download(repo_id=repo_id, local_dir=local_dir)
+        if not os.path.exists("mistral-ov"):
+            snapshot_download(repo_id="OpenVINO/mistral-7b-instruct-v0.1-int8-ov", local_dir="mistral-ov")
+        if not os.path.exists("internvl-ov"):
+            snapshot_download(repo_id="OpenVINO/InternVL2-1B-int8-ov", local_dir="internvl-ov")
+        if not os.path.exists("whisper-ov-model"):
+            snapshot_download(repo_id="OpenVINO/whisper-tiny-fp16-ov", local_dir="whisper-ov-model")
 
         # CPU-specific configuration
         cpu_features = cpuinfo.get_cpu_info()['flags']
-        config_properties = {}
+        config_options = {}
         if 'avx512' in cpu_features:
-            config_properties["ENFORCE_BF16"] = "YES"
+            config_options["ENFORCE_BF16"] = "YES"
         elif 'avx2' in cpu_features:
-            config_properties["INFERENCE_PRECISION_HINT"] = "f32"
+            config_options["INFERENCE_PRECISION_HINT"] = "f32"
 
-        # Initialize Mistral model with updated configuration
-        self.mistral_pipe = ov_genai.LLMPipeline(
+        # Initialize Mistral model
+        self.mistral_pipe = openvino_genai.LLMPipeline(
             "mistral-ov",
             device="CPU",
-            PERFORMANCE_HINT="THROUGHPUT",
-            **config_properties
+            config={"PERFORMANCE_HINT": "THROUGHPUT", **config_options}
         )
+
+        # Initialize Whisper for audio processing
+        self.whisper_pipe = openvino_genai.WhisperPipeline("whisper-ov-model", device="CPU")
 
     def load_data(self, file_path):
         """Load student data from file"""
@@ -123,7 +118,7 @@ class UnifiedAISystem:
         completion_event = Event()
         error = [None]  # Use list to capture exception from thread
 
-        optimized_config = ov_genai.GenerationConfig(
+        optimized_config = openvino_genai.GenerationConfig(
             max_new_tokens=max_tokens,
             temperature=0.3,
             top_p=0.9,
@@ -133,7 +128,7 @@ class UnifiedAISystem:
 
         def callback(tokens):  # Accepts multiple tokens
             response_queue.put("".join(tokens))
-            return ov_genai.StreamingStatus.RUNNING
+            return openvino_genai.StreamingStatus.RUNNING
 
         def generate():
             try:
@@ -227,15 +222,15 @@ class UnifiedAISystem:
 
             # Lazy initialize InternVL
             if self.internvl_pipe is None:
-                self.internvl_pipe = ov_genai.VLMPipeline("internvl-ov", device="CPU")
+                self.internvl_pipe = openvino_genai.VLMPipeline("internvl-ov", device="CPU")
 
             with self.pipe_lock:
                 self.internvl_pipe.start_chat()
                 output = self.internvl_pipe.generate(prompt, image=image_tensor, max_new_tokens=100)
                 self.internvl_pipe.finish_chat()
 
-            # Ensure output is string
-            return str(output)
+            # output is a VLMDecodedResults; rest of the code expects a string
+            return output
 
         except Exception as e:
             return f"❌ Error: {str(e)}"
@@ -286,7 +281,7 @@ class UnifiedAISystem:
             return np.array([], dtype=np.float32)
 
     def transcribe(self, audio):
-        """Transcribe audio using OpenAI Whisper-small model"""
+        """Transcribe audio using Whisper model with improved error handling"""
         if audio is None:
             return ""
         sr, data = audio
@@ -302,17 +297,9 @@ class UnifiedAISystem:
             if len(processed) < 8000:  # 0.5 seconds at 16kHz
                 return ""
 
-            # Lazy initialize Whisper - USING TRANSFORMERS PIPELINE
-            if self.whisper_pipe is None:
-                self.whisper_pipe = pipeline(
-                    "automatic-speech-recognition",
-                    model="openai/whisper-small",
-                    device="cpu"  # Use CPU for consistency
-                )
-
-            # Use transformers pipeline for transcription
-            result = self.whisper_pipe(processed, return_timestamps=False)
-            return result["text"]
+            # Use OpenVINO Whisper pipeline
+            result = self.whisper_pipe.generate(processed)
+            return result
         except Exception as e:
             print(f"Transcription error: {e}")
             return "❌ Transcription failed - please try again"
@@ -360,81 +347,34 @@ class UnifiedAISystem:
         yield from self.generate_text_stream(prompt, max_tokens)
 
     def fetch_images(self, query: str, num: int = DEFAULT_NUM_IMAGES) -> list:
-        """Fetch unique images from educational sources with domain prioritization"""
+        """Fetch unique images by requesting different result pages"""
         if num <= 0:
             return []
 
         try:
             service = build("customsearch", "v1", developerKey=GOOGLE_API_KEY)
             image_links = []
-            seen_urls = set()
-            
-            # Prioritize these educational domains
-            prioritized_domains = [
-                "geeksforgeeks.org",
-                "byjus.com",
-                "khanacademy.org",
-                "edx.org",
-                "coursera.org",
-                "udemy.com",
-                "mit.edu",
-                "harvard.edu",
-                "stanford.edu",
-                "w3schools.com"
-            ]
-            
-            # First pass: Try prioritized domains
-            for domain in prioritized_domains:
+            seen_urls = set()  # To track unique URLs
+
+            # Start from different positions to get unique images
+            for start_index in range(1, num * 2, 2):
                 if len(image_links) >= num:
                     break
-                    
-                full_query = f"{query} site:{domain}"
-                
-                try:
-                    res = service.cse().list(
-                        q=full_query,
-                        cx=GOOGLE_CSE_ID,
-                        searchType="image",
-                        num=1,
-                        safe="active"
-                    ).execute()
-                    
-                    if "items" in res and res["items"]:
-                        item = res["items"][0]
-                        if item["link"] not in seen_urls:
-                            image_links.append(item["link"])
-                            seen_urls.add(item["link"])
-                except Exception:
-                    continue  # Skip if domain search fails
 
-            # Second pass: General search if we still need more images
-            if len(image_links) < num:
-                start_index = 1
-                while len(image_links) < num:
-                    try:
-                        res = service.cse().list(
-                            q=query + " education OR learning OR tutorial",
-                            cx=GOOGLE_CSE_ID,
-                            searchType="image",
-                            num=min(2, num - len(image_links)),
-                            start=start_index,
-                            safe="active",
-                            imgType="photo",
-                            rights="cc_publicdomain|cc_attribute|cc_sharealike"
-                        ).execute()
+                res = service.cse().list(
+                    q=query,
+                    cx=GOOGLE_CSE_ID,
+                    searchType="image",
+                    num=1,
+                    start=start_index
+                ).execute()
 
-                        if "items" in res and res["items"]:
-                            for item in res["items"]:
-                                if len(image_links) >= num:
-                                    break
-                                if item["link"] not in seen_urls:
-                                    image_links.append(item["link"])
-                                    seen_urls.add(item["link"])
-                            start_index += len(res["items"])
-                        else:
-                            break  # No more results
-                    except Exception:
-                        break  # Stop on error
+                if "items" in res and res["items"]:
+                    item = res["items"][0]
+                    # Skip duplicates
+                    if item["link"] not in seen_urls:
+                        image_links.append(item["link"])
+                        seen_urls.add(item["link"])
 
             return image_links[:num]
         except Exception as e:
@@ -446,8 +386,7 @@ ai_system = UnifiedAISystem()
 
 # CSS styles with improved output box
 css = """
-  /* Simplified dark-mode CSS with bright accents */
-:root {
+    :root {
   --bg: #0D0D0D;
   --surface: #1F1F1F;
   --primary: #BB86FC;
@@ -506,7 +445,6 @@ body, .gradio-container { background: var(--bg); color: var(--text); }
 .chatbot::-webkit-scrollbar-track{background:var(--surface);border-radius:4px}
 .chatbot::-webkit-scrollbar-thumb{background:var(--primary);border-radius:4px}
 .chatbot::-webkit-scrollbar-thumb:hover{background:var(--secondary)}
-
 
 """
 
@@ -827,4 +765,4 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
     )
 
 if __name__ == "__main__":
-    demo.launch(share=True, debug=True, show_api=False)
+    demo.launch(share=True, debug=True)
