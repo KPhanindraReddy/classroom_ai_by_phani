@@ -1,0 +1,12 @@
+openvino-genai
+gradio>=4.0
+pandas
+numpy
+requests
+Pillow
+python-docx
+PyPDF2
+librosa
+transformers
+google-api-python-client
+huggingface_hub
